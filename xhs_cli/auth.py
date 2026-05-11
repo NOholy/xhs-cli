@@ -167,11 +167,11 @@ def _browser_assisted_qrcode_login() -> str:
     """Login via QR code using network responses instead of page DOM heuristics."""
     import time
 
-    from camoufox.sync_api import Camoufox
+    from .browser import get_browser
 
     print("🔑 Starting QR code login...")
 
-    with Camoufox(headless=True) as browser:
+    with get_browser(headless=True) as browser:
         page = browser.new_page()
         state = {"last_status": -1}
 

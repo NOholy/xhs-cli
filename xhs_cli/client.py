@@ -48,7 +48,7 @@ class XhsClient:
 
     def __init__(self, cookie_dict: dict):
         self._cookie_dict = cookie_dict
-        self._camoufox_ctx = None
+        self._engine = None
         self._browser = None
         self._page = None
 
@@ -119,12 +119,11 @@ class XhsClient:
         return str(note_id or "")
 
     def start(self):
-        """Launch camoufox and inject cookies."""
-        from camoufox.sync_api import Camoufox
+        """Launch browser and inject cookies."""
+        from .browser import BrowserEngine
 
-        logger.info("Starting camoufox browser...")
-        self._camoufox_ctx = Camoufox(headless=True)
-        self._browser = self._camoufox_ctx.__enter__()
+        self._engine = BrowserEngine(headless=True)
+        self._browser = self._engine.start()
         self._page = self._browser.new_page()
 
         # Inject cookies
@@ -146,12 +145,12 @@ class XhsClient:
 
     def close(self):
         """Shut down the browser."""
-        if self._camoufox_ctx:
+        if self._engine:
             try:
-                self._camoufox_ctx.__exit__(None, None, None)
+                self._engine.close()
             except Exception:
                 pass
-            self._camoufox_ctx = None
+            self._engine = None
             self._browser = None
             self._page = None
             logger.info("Browser closed.")
