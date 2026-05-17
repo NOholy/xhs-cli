@@ -214,10 +214,19 @@ class XhsClient:
         """Get note detail by navigating to the explore page.
 
         Extracts from __INITIAL_STATE__.note.noteDetailMap.
+
+        When ``xsec_token`` is missing the explore page shows a QR-code gate
+        ("请打开小红书App扫码查看"). In that case we raise ``DataFetchError``
+        immediately — callers (e.g. ``CliXhsPcApiAdapter``) should catch this
+        and fall back to the Direct API which has proper request signing.
         """
+        if not xsec_token:
+            raise DataFetchError(
+                f"笔记 {note_id} 缺少 xsec_token，浏览器方式无法获取"
+            )
+
         url = f"https://www.xiaohongshu.com/explore/{note_id}"
-        if xsec_token:
-            url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
+        url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
 
         logger.info("Loading note: %s", note_id)
         self._goto(
@@ -888,35 +897,31 @@ class XhsClient:
     def post_comment(self, note_id: str, content: str, xsec_token: str = "") -> bool:
         """Post a comment on a note by typing into the comment input."""
         self._navigate_to_note(note_id, xsec_token)
+        self._human_scroll()
         before_count = self._get_comment_count(note_id)
 
-        # Find and click comment input
         try:
-            input_el = self._page.query_selector('#content-textarea')
-            if not input_el:
-                input_el = self._page.query_selector('[contenteditable="true"]')
-            if not input_el:
-                raise RuntimeError("Comment input not found")
+            # 1. Find and click comment input robustly
+            input_sel = '#content-textarea, [contenteditable="true"], .comment-input, [placeholder*="说点什么"]'
+            input_loc = self._page.locator(input_sel).first
+            input_loc.wait_for(state="attached", timeout=5000)
 
-            input_el.click()
-            self._human_wait(0.3, 0.8)
-            input_el.type(content, delay=random.randint(50, 150))
+            self._human_type(input_loc, content)
             self._human_wait(0.5, 1.0)
 
-            # Click submit button
-            submit = self._page.query_selector('.submit.active') or \
-                     self._page.query_selector('button.submit')
-            if submit:
-                submit.click()
-                self._human_wait(1, 2)
-                if self._verify_comment_submitted(note_id, before_count):
+            # 2. Click submit button robustly
+            submit_sel = '.submit.active, button.submit, .submit-btn, button:has-text("发送"), button:has-text("评论"), div[role="button"]:has-text("发送")'
+            submit_loc = self._page.locator(submit_sel).first
+            
+            if submit_loc.is_visible():
+                self._human_click(submit_loc)
+                if self._verify_comment_submitted(note_id, before_count, content):
                     logger.info("Comment posted on %s", note_id)
                     return True
 
             # Try pressing Enter as fallback
-            self._page.keyboard.press("Enter")
-            self._human_wait(1, 2)
-            if self._verify_comment_submitted(note_id, before_count):
+            input_loc.press("Enter")
+            if self._verify_comment_submitted(note_id, before_count, content):
                 logger.info("Comment posted (Enter) on %s", note_id)
                 return True
             logger.warning("Comment submit attempted but no success signal found for %s", note_id)
@@ -961,22 +966,122 @@ class XhsClient:
             pass
         return -1
 
-    def _verify_comment_submitted(self, note_id: str, before_count: int) -> bool:
-        """Check whether comment submit succeeded."""
-        # A visible success toast/message is the strongest signal.
-        try:
-            body_text = (self._page.text_content("body") or "").strip()
-        except Exception:
-            body_text = ""
-        success_tokens = ("评论成功", "发布成功", "发送成功", "success")
-        if body_text and any(token in body_text.lower() for token in success_tokens):
-            return True
+    def _verify_comment_submitted(self, note_id: str, before_count: int, content: str = "", timeout: float = 8.0) -> bool:
+        """Wait and verify whether comment submit succeeded within a timeout."""
+        start = time.time()
+        while time.time() - start < timeout:
+            # A visible success toast/message is the strongest signal.
+            try:
+                body_text = (self._page.text_content("body") or "").strip()
+            except Exception:
+                body_text = ""
+            success_tokens = ("评论成功", "发布成功", "发送成功", "success")
+            if body_text and any(token in body_text.lower() for token in success_tokens):
+                return True
 
-        # Fallback: comment count increased.
-        after_count = self._get_comment_count(note_id)
-        if before_count >= 0 and after_count >= 0 and after_count > before_count:
-            return True
+            # Check if the content we just typed appears in the DOM (comment list)
+            if content and content in body_text:
+                return True
+
+            # Fallback: comment count increased. Note that __INITIAL_STATE__ might not update,
+            # but we check just in case the DOM representation of the count changed.
+            try:
+                # Try to scrape the comment count from the DOM
+                count_el = self._page.query_selector('.comment-count, .count')
+                if count_el:
+                    count_text = (count_el.text_content() or "").strip()
+                    import re
+                    m = re.search(r'\d+', count_text)
+                    if m and int(m.group(0)) > before_count:
+                        return True
+            except Exception:
+                pass
+
+            after_count = self._get_comment_count(note_id)
+            if before_count >= 0 and after_count >= 0 and after_count > before_count:
+                return True
+                
+            time.sleep(0.5)
+            
         return False
+
+    # ===== Publish Note =====
+
+    def reply_comment(self, note_id: str, comment_id: str, content: str, xsec_token: str = "") -> bool:
+        """Reply to a specific comment on a note."""
+        self._navigate_to_note(note_id, xsec_token)
+        self._human_scroll()
+        before_count = self._get_comment_count(note_id)
+
+        try:
+            # 1. Extract target comment text from __INITIAL_STATE__ to use robust visual targeting
+            target_text = ""
+            if comment_id:
+                try:
+                    target_text = self._page.evaluate("""(cid) => {
+                        const s = window.__INITIAL_STATE__;
+                        if (!s || !s.note || !s.note.noteDetailMap) return "";
+                        const map = s.note.noteDetailMap;
+                        const detail = map[Object.keys(map)[0]];
+                        if (!detail || !detail.comments || !detail.comments.list) return "";
+                        
+                        const findInList = (list) => {
+                            for (let c of list) {
+                                if (c.id === cid || c.commentId === cid || c.comment_id === cid) return c.content;
+                                if (c.subComments) {
+                                    const res = findInList(c.subComments);
+                                    if (res) return res;
+                                }
+                            }
+                            return "";
+                        };
+                        return findInList(detail.comments.list);
+                    }""", comment_id)
+                except Exception as e:
+                    logger.warning("Failed to extract target text: %s", e)
+            
+            # Use the pipeline method if we found the text! This is extremely robust.
+            if target_text and self.reply_to_target_comment(target_text, content, note_id):
+                return True
+                
+            # Global fallback if target_text method fails or comment_id is empty
+            logger.warning("Falling back to global reply button locator.")
+            
+            reply_sel = '.reply, .reply-button, text="回复", span:has-text("回复")'
+            reply_btn_loc = self._page.locator(reply_sel).first
+            reply_btn_loc.wait_for(state="visible", timeout=5000)
+            self._human_click(reply_btn_loc)
+            self._human_wait(0.3, 0.8)
+
+            # 2. Find reply input
+            input_sel = '#content-textarea, [contenteditable="true"], .comment-input, [placeholder*="回复"]'
+            input_loc = self._page.locator(input_sel).first
+            input_loc.wait_for(state="attached", timeout=3000)
+
+            self._human_type(input_loc, content)
+            self._human_wait(0.5, 1.0)
+
+            # 3. Submit reply
+            submit_sel = '.submit.active, button.submit, .submit-btn, button:has-text("发送"), button:has-text("评论"), div[role="button"]:has-text("发送")'
+            submit_loc = self._page.locator(submit_sel).first
+
+            if submit_loc.is_visible():
+                self._human_click(submit_loc)
+                if self._verify_comment_submitted(note_id, before_count, content):
+                    logger.info("Reply posted on note %s", note_id)
+                    return True
+
+            input_loc.press("Enter")
+            if self._verify_comment_submitted(note_id, before_count, content):
+                logger.info("Reply posted (Enter) on note %s", note_id)
+                return True
+            
+            logger.warning("Reply submit attempted but no success signal found for %s", note_id)
+            return False
+
+        except Exception as e:
+            logger.error("Failed to reply to comment: %s", e)
+            return False
 
     # ===== Publish Note =====
 
@@ -1079,7 +1184,7 @@ class XhsClient:
             for sel in upload_area_selectors:
                 area = self._page.query_selector(sel)
                 if area:
-                    area.click()
+                    self._human_click(area)
                     self._human_wait(1, 2)
                     break
 
@@ -1127,15 +1232,16 @@ class XhsClient:
         for sel in title_selectors:
             title_el = self._page.query_selector(sel)
             if title_el:
-                title_el.click()
-                self._human_wait(0.3, 0.5)
-                title_el.fill(title)
+                self._human_type(title_el, title)
                 logger.info("Title filled: %s", title)
                 break
         else:
             logger.warning("Title input not found, trying keyboard input")
             # Some pages may focus the title field automatically
-            self._page.keyboard.type(title)
+            for char in title:
+                self._page.keyboard.press(char, delay=random.randint(20, 100))
+                if random.random() < 0.1:
+                    time.sleep(random.uniform(0.1, 0.3))
 
         self._human_wait(0.5, 1)
 
@@ -1155,14 +1261,7 @@ class XhsClient:
             for sel in content_selectors:
                 content_el = self._page.query_selector(sel)
                 if content_el:
-                    content_el.click()
-                    self._human_wait(0.3, 0.5)
-                    # contenteditable divs need keyboard input, not fill
-                    tag = content_el.evaluate("el => el.tagName.toLowerCase()")
-                    if tag in ("textarea", "input"):
-                        content_el.fill(content)
-                    else:
-                        self._page.keyboard.type(content)
+                    self._human_type(content_el, content)
                     logger.info("Content filled (%d chars)", len(content))
                     break
             else:
@@ -1183,7 +1282,7 @@ class XhsClient:
             publish_btn = self._page.query_selector(sel)
             if publish_btn:
                 logger.info("Clicking publish button...")
-                publish_btn.click()
+                self._human_click(publish_btn)
                 self._human_wait(3, 5)
 
                 page_text = self._page.text_content("body") or ""
@@ -1230,7 +1329,7 @@ class XhsClient:
             if not el:
                 continue
             try:
-                el.click()
+                self._human_click(el)
                 self._human_wait(0.8, 1.5)
                 menu_opened = True
                 break
@@ -1253,7 +1352,7 @@ class XhsClient:
             if not el:
                 continue
             try:
-                el.click()
+                self._human_click(el)
                 self._human_wait(0.8, 1.5)
                 delete_clicked = True
                 break
@@ -1275,7 +1374,7 @@ class XhsClient:
             if not el:
                 continue
             try:
-                el.click()
+                self._human_click(el)
                 self._human_wait(2, 3)
                 break
             except Exception:
@@ -1323,6 +1422,116 @@ class XhsClient:
             return any(token in normalized for token in unavailable_tokens)
         except Exception:
             return False
+
+    # ===== Pipeline Methods =====
+
+    def click_into_note_card(self, note_id: str):
+        """Pipeline operation: Find note card on current page and click it."""
+        logger.info("Pipeline: Clicking into note %s", note_id)
+        card_locator = self._page.locator(f'a[href*="{note_id}"]').first
+        card_locator.scroll_into_view_if_needed()
+        self._human_wait(1.0, 2.5)
+        
+        self._human_click(card_locator)
+        
+        self._wait_for_data(
+            """() => {
+                const s = window.__INITIAL_STATE__;
+                return s && s.note && s.note.noteDetailMap
+                    && Object.keys(s.note.noteDetailMap).length > 0;
+            }""",
+            timeout=15.0,
+            desc="note modal",
+            raise_on_timeout=True,
+        )
+
+    def scroll_and_read_comments(self, scroll_batches: int = 3) -> list[dict]:
+        """Pipeline operation: Scroll and fetch dynamic comments via XHR."""
+        logger.info("Pipeline: Scrolling to read comments")
+        comments_pool = []
+        
+        def handle_response(response):
+            if "comment/page" in response.url and response.status == 200:
+                try:
+                    data = response.json()
+                    comments_pool.extend(data.get("data", {}).get("comments", []))
+                except Exception:
+                    pass
+
+        self._page.on("response", handle_response)
+        
+        for _ in range(scroll_batches):
+            self._human_scroll()
+            self._human_wait(2.0, 4.0)
+            
+        self._page.remove_listener("response", handle_response)
+        
+        # Fallback to INITIAL_STATE
+        initial = self._page.evaluate("""() => {
+            if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.note) {
+                const map = window.__INITIAL_STATE__.note.noteDetailMap || {};
+                const detail = map[Object.keys(map)[0]];
+                if (detail && detail.comments && Array.isArray(detail.comments.list)) {
+                    return detail.comments.list;
+                }
+            }
+            return [];
+        }""")
+        if isinstance(initial, list):
+            comments_pool.extend(initial)
+            
+        # Deduplicate
+        seen = set()
+        unique_comments = []
+        for c in comments_pool:
+            if not isinstance(c, dict): continue
+            cid = c.get("id") or c.get("commentId") or c.get("comment_id")
+            if cid and cid not in seen:
+                seen.add(cid)
+                unique_comments.append(c)
+                
+        return unique_comments
+
+    def reply_to_target_comment(self, target_text: str, reply_content: str, note_id: str = "") -> bool:
+        """Pipeline operation: Reply based on comment text, mimicking a real user."""
+        logger.info("Pipeline: Replying to target comment containing: '%s'", target_text[:20])
+        before_count = self._get_comment_count(note_id) 
+        
+        comment_block = self._page.locator('.comment-item').filter(has_text=target_text).first
+        
+        if not comment_block.is_visible():
+            self._human_scroll()
+            self._human_wait(1.0, 2.0)
+            
+        if not comment_block.is_visible():
+            logger.warning("Target comment not visible for reply")
+            return False
+            
+        reply_btn = comment_block.locator('.reply, .reply-button').first
+        try:
+            self._human_click(reply_btn)
+            self._human_wait(0.5, 1.2)
+        except Exception as e:
+            logger.warning("Failed to click reply button: %s", e)
+            return False
+            
+        input_box = self._page.locator('#content-textarea, [placeholder*="回复"]').first
+        if not input_box.is_visible():
+            logger.warning("Reply input box not visible")
+            return False
+            
+        self._human_type(input_box, reply_content)
+        self._human_wait(0.5, 1.0)
+        
+        submit_btn = self._page.locator('.submit, .submit-btn, button:has-text("发送")').first
+        if submit_btn.is_visible():
+            self._human_click(submit_btn)
+            
+        if self._verify_comment_submitted(note_id, before_count, reply_content):
+            logger.info("Pipeline: Reply submitted successfully")
+            return True
+            
+        return False
 
     # ===== Internal: Interaction helpers =====
 
@@ -1383,6 +1592,7 @@ class XhsClient:
         }
 
         self._navigate_to_note(note_id, xsec_token)
+        self._human_scroll()
 
         # Check current state
         state = self._get_interact_state(note_id)
@@ -1399,7 +1609,7 @@ class XhsClient:
             logger.error("%s button not found: %s", action, selector)
             return False
 
-        el.click()
+        self._human_click(el)
         self._human_wait(2, 3)
 
         # Verify
@@ -1413,7 +1623,7 @@ class XhsClient:
         logger.warning("State didn't change, retrying click...")
         el = self._page.query_selector(selector)
         if el:
-            el.click()
+            self._human_click(el)
             self._human_wait(2, 3)
 
         state = self._get_interact_state(note_id)
@@ -1436,9 +1646,56 @@ class XhsClient:
         wait_min: float = 1.0,
         wait_max: float = 2.0,
         context: str = "loading page",
+        force_direct: bool = False,
     ):
-        """Navigate to URL and fail fast if redirected to risk-control pages."""
-        self._page.goto(url, wait_until=wait_until, timeout=timeout)
+        """Navigate to URL, preferring 'fake link click' to bypass TYPED navigation detection."""
+        try:
+            current_url = getattr(self._page, "url", "")
+            
+            # --- Optimization: Skip redundant navigation ---
+            # If the daemon browser is already on the target note, return instantly
+            if "/explore/" in url and "/explore/" in current_url:
+                target_note_id = url.split("/explore/")[1].split("?")[0]
+                current_note_id = current_url.split("/explore/")[1].split("?")[0]
+                if target_note_id == current_note_id:
+                    logger.info("Already on note %s, skipping redundant navigation.", target_note_id)
+                    return
+
+            if not force_direct and "xiaohongshu.com" in current_url and current_url != "about:blank":
+                logger.info("Fake-link navigating to %s", url)
+                link_id = f"fake-nav-{int(time.time()*1000)}"
+                
+                self._page.evaluate(f"""
+                    () => {{
+                        const a = document.createElement('a');
+                        a.id = '{link_id}';
+                        a.href = '{url}';
+                        a.target = '_self'; 
+                        a.textContent = ' ';
+                        a.style.position = 'fixed';
+                        a.style.top = '10px';
+                        a.style.left = '10px';
+                        a.style.width = '10px';
+                        a.style.height = '10px';
+                        a.style.opacity = '0.01';
+                        a.style.zIndex = '999999';
+                        document.body.appendChild(a);
+                    }}
+                """)
+                
+                loc = self._page.locator(f"#{link_id}")
+                with self._page.expect_navigation(wait_until=wait_until, timeout=timeout):
+                    self._human_click(loc)
+            else:
+                self._page.goto(url, wait_until=wait_until, timeout=timeout)
+                
+        except Exception as e:
+            logger.warning("Navigation failed (%s), falling back to direct goto", e)
+            try:
+                self._page.goto(url, wait_until=wait_until, timeout=timeout)
+            except Exception:
+                pass
+
         self._human_wait(wait_min, wait_max)
         self._raise_if_blocked(context, include_body=True)
 
@@ -1475,6 +1732,8 @@ class XhsClient:
             "请求太频繁",
             "安全验证",
             "扫码验证",
+            "打开小红书app",
+            "扫码查看",
         )
         for marker in body_markers:
             if marker in body_text:
@@ -1537,3 +1796,56 @@ class XhsClient:
     def _human_wait(self, min_sec: float = 1.0, max_sec: float = 3.0):
         """Wait a random human-like interval."""
         time.sleep(random.uniform(min_sec, max_sec))
+
+    def _human_click(self, element):
+        """Simulate a human clicking an element using professional anti-fingerprint hooks."""
+        try:
+            element.scroll_into_view_if_needed()
+            self._human_wait(0.1, 0.4)
+            # cloakbrowser (with humanize=True) automatically intercepts .click() 
+            # and applies a physics-based Bezier curve trajectory internally.
+            element.click()
+        except Exception as e:
+            logger.warning("Human click failed, falling back to simple click: %s", e)
+            try:
+                element.click()
+            except Exception:
+                pass
+
+    def _human_type(self, element, text: str):
+        """Simulate a human typing text using professional anti-fingerprint hooks."""
+        try:
+            self._human_click(element)
+            self._human_wait(0.1, 0.3)
+            # cloakbrowser intercepts .type() and applies realistic keypress delays
+            element.type(text)
+            self._human_wait(0.1, 0.3)
+        except Exception as e:
+            logger.warning("Human type failed, falling back to simple type: %s", e)
+            try:
+                element.type(text, delay=random.randint(50, 150))
+            except Exception:
+                pass
+
+    def _human_scroll(self):
+        """Simulate a user browsing by scrolling the page."""
+        try:
+            viewport = self._page.viewport_size
+            if not viewport:
+                return
+            
+            # Initial read pause
+            self._human_wait(1.0, 2.5)
+            
+            # Scroll down slowly
+            for _ in range(random.randint(1, 3)):
+                scroll_y = random.randint(200, 600)
+                self._page.mouse.wheel(0, scroll_y)
+                self._human_wait(0.5, 1.5)
+            
+            # Scroll back up a bit
+            if random.random() > 0.3:
+                self._page.mouse.wheel(0, -random.randint(100, 400))
+                self._human_wait(0.3, 1.0)
+        except Exception:
+            pass
