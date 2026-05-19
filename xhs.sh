@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 
 # 默认设置
-ENGINE=${XHS_BROWSER_ENGINE:-"cloak"}
+ENGINE=${XHS_BROWSER_ENGINE:-"obscura"}
 
 # 显示帮助
 show_help() {
     echo "使用方法: ./xhs.sh [选项] <命令> [参数]"
     echo ""
     echo "选项:"
-    echo "  -e, --engine ENGINE   指定底层引擎 (可选: camoufox, cloak, playwright)，默认: cloak"
+    echo "  -e, --engine ENGINE   指定底层引擎 (可选: obscura, camoufox, cloak, playwright)，默认: obscura"
     echo "  -p, --path PATH       如果引擎是 playwright，指定自定义防指纹浏览器内核二进制路径"
     echo "  -H, --humanize        开启拟人化操作 (针对 cloak 引擎，模拟真实鼠标轨迹和打字延迟)"
     echo "  -h, --help            显示此帮助信息"
     echo ""
     echo "支持的小红书 CLI 命令 (如 search, status, login, whoami 等):"
     echo "  ./xhs.sh search '测试'"
-    echo "  ./xhs.sh -e cloak search '测试'"
+    echo "  ./xhs.sh -e obscura search '测试'"
     echo "  ./xhs.sh -e playwright -p /usr/local/bin/chrome status"
 }
 

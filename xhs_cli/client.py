@@ -1798,12 +1798,18 @@ class XhsClient:
         time.sleep(random.uniform(min_sec, max_sec))
 
     def _human_click(self, element):
-        """Simulate a human clicking an element using professional anti-fingerprint hooks."""
+        """Simulate a human clicking an element. With Obscura, event.isTrusted is natively true."""
         try:
             element.scroll_into_view_if_needed()
             self._human_wait(0.1, 0.4)
-            # cloakbrowser (with humanize=True) automatically intercepts .click() 
-            # and applies a physics-based Bezier curve trajectory internally.
+            # Use mouse movement to hover first for more natural interaction
+            box = element.bounding_box()
+            if box:
+                # Move to a random point inside the element
+                x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
+                y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
+                self._page.mouse.move(x, y, steps=random.randint(5, 10))
+                self._human_wait(0.05, 0.2)
             element.click()
         except Exception as e:
             logger.warning("Human click failed, falling back to simple click: %s", e)
@@ -1813,12 +1819,12 @@ class XhsClient:
                 pass
 
     def _human_type(self, element, text: str):
-        """Simulate a human typing text using professional anti-fingerprint hooks."""
+        """Simulate a human typing text."""
         try:
             self._human_click(element)
             self._human_wait(0.1, 0.3)
-            # cloakbrowser intercepts .type() and applies realistic keypress delays
-            element.type(text)
+            # Use Playwright's native delay which is very effective
+            element.type(text, delay=random.randint(50, 150))
             self._human_wait(0.1, 0.3)
         except Exception as e:
             logger.warning("Human type failed, falling back to simple type: %s", e)

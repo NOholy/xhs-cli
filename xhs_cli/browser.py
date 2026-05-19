@@ -14,7 +14,7 @@ class BrowserEngine:
         self.browser = None
 
     def start(self):
-        engine_type = os.getenv("XHS_BROWSER_ENGINE", "cloak").lower()
+        engine_type = os.getenv("XHS_BROWSER_ENGINE", "obscura").lower()
         logger.info("Starting browser engine: %s", engine_type)
         
         if engine_type == "cloak":
@@ -26,6 +26,13 @@ class BrowserEngine:
             from camoufox.sync_api import Camoufox
             self._ctx_manager = Camoufox(headless=self.headless)
             self.browser = self._ctx_manager.__enter__()
+            
+        elif engine_type == "obscura":
+            from playwright.sync_api import sync_playwright
+            logger.info("Connecting to obscura via CDP at ws://127.0.0.1:9222")
+            self._ctx_manager = sync_playwright().start()
+            self.browser = self._ctx_manager.chromium.connect_over_cdp("ws://127.0.0.1:9222/devtools/browser")
+            
         else:
             raise ValueError(f"Unknown browser engine: {engine_type}")
             
@@ -33,9 +40,18 @@ class BrowserEngine:
 
     def close(self):
         if hasattr(self, 'browser') and self.browser:
-            self.browser.close()
+            try:
+                self.browser.close()
+            except Exception:
+                pass
         if self._ctx_manager:
-            self._ctx_manager.__exit__(None, None, None)
+            try:
+                if hasattr(self._ctx_manager, '__exit__'):
+                    self._ctx_manager.__exit__(None, None, None)
+                elif hasattr(self._ctx_manager, 'stop'):
+                    self._ctx_manager.stop()
+            except Exception:
+                pass
             self._ctx_manager = None
             
         self.browser = None
